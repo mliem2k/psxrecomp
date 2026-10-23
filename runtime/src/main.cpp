@@ -18098,6 +18098,7 @@ int main(int argc, char** argv) {
                         gc.runtime.guest_cycle_scale_gated ? ", mod gate" : "",
                         psx_guest_cycle_scale_config());
             g_present_thread = gc.runtime.video_present_thread ? 1 : 0;
+            g_present_thread_slots = gc.runtime.video_present_thread_slots;
             g_video_vsync       = gc.runtime.video_vsync;
             g_frame_interpolation = gc.runtime.video_frame_interpolation ? 1 : 0;
             g_frame_interpolation_fps = gc.runtime.video_frame_interpolation_fps;
