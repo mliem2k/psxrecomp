@@ -1732,6 +1732,7 @@ static void quality_apply_video_globals(const PSXRecompV4::RuntimeConfig& r) {
     g_video_pgxp_depth_threshold  = (float)r.video_pgxp_depth_threshold;
     g_render_thread      = r.video_render_thread ? 1 : 0;
     g_present_thread     = r.video_present_thread ? 1 : 0;
+    g_present_thread_slots = r.video_present_thread_slots;
     g_frame_generation   = r.video_frame_generation ? 1 : 0;
     g_frame_generation_method = r.video_frame_generation_method;
     g_frame_interpolation     = r.video_frame_interpolation ? 1 : 0;
@@ -20631,7 +20632,7 @@ session_reboot:
     if (const char* e = std::getenv("PSX_PRESENT_THREAD"))
         g_present_thread = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PRESENT_THREAD_SLOTS"))
-        g_present_thread_slots = std::atoi(e) > 0 ? std::atoi(e) : 3;
+        g_present_thread_slots = std::atoi(e) > 0 ? std::atoi(e) : g_present_thread_slots;
     if (const char* e = std::getenv("PSX_FRAME_GEN"))
         g_frame_generation = (*e && *e != '0') ? 1 : 0;
     /* PSX_FRAME_GEN_METHOD=redraw|reprojection overrides [video]
