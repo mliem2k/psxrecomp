@@ -542,7 +542,8 @@ enum {
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
-    RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_GROUP
+    RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN,
+    RTH_VRAM_SYNC_COPY, RTH_GROUP
 };
 /* Producer-side geometry publication for an optional seam-prepared pass.
  * Collection never reads the render owner's mutable snap index. */
@@ -16097,6 +16098,25 @@ static void rtb_vram_upload_open(int open) {
 static void rtb_hd_texture_note(int op, int x, int y, int w, int h, int sx, int sy) {
     RTH_DIRECT_OR(RTH_REC(RTH_HD_NOTE, 0, op, x, y, w, h, sx, sy)); hd_note_exec(op, x, y, w, h, sx, sy); }
 static void rtb_vram_transfer_out(int x, int y, int w, int h, uint16_t *d) {
+    if (!d || w <= 0 || h <= 0) return;
+    /* Under HD authority, native rasterization already produced the exact
+     * guest pixels in the render owner's private CPU buffer. Publish them in
+     * command order without migrating the GL context (and flushing the driver)
+     * for a CPU memcpy. Main waits before reading the published buffer, and
+     * cannot enqueue later guest work until the transfer has returned. */
+    if (s_hd_native_authority && rth_record_mode()) {
+        RTH_REC(RTH_VRAM_SYNC_COPY, 0, 0);
+        rt_drain();
+        if (x == 0 && y == 0 && w == VRAM_W && h == VRAM_H) {
+            memcpy(d, s_rth_vram_pub, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+            return;
+        }
+        for (int j = 0; j < h; ++j)
+            for (int i = 0; i < w; ++i)
+                d[(size_t)j * w + i] =
+                    s_rth_vram_pub[((y + j) & 511) * VRAM_W + ((x + i) & 1023)];
+        return;
+    }
     GL_RT_SYNC("vram_transfer_out"); glb_vram_transfer_out(x, y, w, h, d); }
 static void rtb_set_draw_area(int x1, int y1, int x2, int y2) {
     if (rth_record_mode()) {
@@ -16560,6 +16580,9 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         s_async_seam_reset_pending = 0;
         break;
     }
+    case RTH_VRAM_SYNC_COPY:
+        memcpy(s_rth_vram_pub, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+        break;
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);
         (void)gl_renderer_fbo_peek(v[0], v[1], v[2], v[3], (uint16_t *)(uintptr_t)ptr);
