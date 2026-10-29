@@ -143,6 +143,14 @@ int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                 uint32_t entry_pc, uint8_t** out_data,
                                 size_t* out_len);
 
+/* Main-thread snapshot with a reserved VRAM section. The blob is INCOMPLETE
+ * until the caller fills *out_vram with 1024*512 little-endian halfwords from
+ * this exact command-stream point. No guest execution may intervene between
+ * this call and queuing that copy. Keep the blob alive until copy completion. */
+int boot_state_save_buffer_raw_deferred(const CPUState* cpu, uint32_t bios_checksum,
+                                       uint32_t entry_pc, uint8_t** out_data,
+                                       size_t* out_len, uint16_t** out_vram);
+
 /* §96 telemetry: after the latest save, how many VRAM scanlines were dirty
  * and whether the incremental mirror path patched (vs full memcpy). */
 uint32_t boot_state_last_vram_dirty_rows(void);

@@ -224,6 +224,7 @@ typedef struct BsOut {
     size_t   len;
     size_t   cap;
     int      no_zlib; /* 1 => always raw sections (netplay snap ring) */
+    size_t*  deferred_vram;
 } BsOut;
 
 static int bs_write(BsOut* o, const void* p, size_t n) {
@@ -374,6 +375,13 @@ static int write_timer_section(BsOut* o) {
 /* Classic full VRAM section (offline / zlib / tracking off). */
 static int write_vram_section_full(BsOut *o)
 {
+    if (o->deferred_vram) {
+        /* Reserve the wire section while main owns all CPU/device state.
+         * The caller fills these bytes from the matching render-stream point
+         * before publishing the blob. No pointer escapes until realloc ends. */
+        *o->deferred_vram = o->len + 16u;
+        return write_section_raw(o, BS_SEC_VRAM, 0, gpu_get_vram(), VRAM_SIZE);
+    }
     uint16_t *vbuf = (uint16_t *)malloc(VRAM_SIZE);
     int ok;
     if (!vbuf)
@@ -470,7 +478,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) {
         /* §96 incremental mirror only while RB dirty-tracking is on.
          * Offline / delay-sync / zlib disk: classic full transfer_out. */
-        if (o->no_zlib && gpu_vram_dirty_tracking()) {
+        if (o->no_zlib && !o->deferred_vram && gpu_vram_dirty_tracking()) {
             ok = sync_vram_mirror_for_save();
             if (ok) {
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
@@ -589,13 +597,14 @@ int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
 
 static int boot_state_save_buffer_ex(const CPUState* cpu, uint32_t bios_checksum,
                                      uint32_t entry_pc, uint8_t** out_data,
-                                     size_t* out_len, int no_zlib) {
+                                     size_t* out_len, int no_zlib, size_t* deferred_vram) {
     BsOut o;
     if (!out_data || !out_len) return 0;
     *out_data = NULL;
     *out_len = 0;
     memset(&o, 0, sizeof o);
     o.no_zlib = no_zlib ? 1 : 0;
+    o.deferred_vram = deferred_vram;
     /* Compressed MotK ~1.3-1.5 MiB; raw ~3.5-4 MiB (2 MB RAM) or ~9.5 MiB (8 MB). */
     o.cap = no_zlib ? (12u * 1024u * 1024u) : (2u * 1024u * 1024u);
     o.data = (uint8_t*)malloc(o.cap);
@@ -613,14 +622,26 @@ int boot_state_save_buffer(const CPUState* cpu, uint32_t bios_checksum,
                            uint32_t entry_pc, uint8_t** out_data,
                            size_t* out_len) {
     return boot_state_save_buffer_ex(cpu, bios_checksum, entry_pc, out_data,
-                                     out_len, 0);
+                                     out_len, 0, NULL);
 }
 
 int boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                uint32_t entry_pc, uint8_t** out_data,
                                size_t* out_len) {
     return boot_state_save_buffer_ex(cpu, bios_checksum, entry_pc, out_data,
-                                     out_len, 1);
+                                     out_len, 1, NULL);
+}
+
+int boot_state_save_buffer_raw_deferred(const CPUState* cpu, uint32_t bios_checksum,
+                                       uint32_t entry_pc, uint8_t** out_data,
+                                       size_t* out_len, uint16_t** out_vram) {
+    size_t offset = 0;
+    if (!out_vram) return 0;
+    *out_vram = NULL;
+    if (!boot_state_save_buffer_ex(cpu, bios_checksum, entry_pc, out_data,
+                                   out_len, 1, &offset)) return 0;
+    *out_vram = (uint16_t*)(*out_data + offset);
+    return 1;
 }
 
 /* ============================ LOAD ============================ */

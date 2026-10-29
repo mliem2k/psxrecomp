@@ -120,6 +120,9 @@ void gpu_timeline_note(uint8_t k,uint32_t a,uint32_t b){(void)k;(void)a;(void)b;
 
 static uint16_t vram[1024*512];
 static int checks, failures;
+static void vram_copy_done(void *user) {
+    atomic_fetch_add_explicit((atomic_int*)user, 1, memory_order_release);
+}
 static void check(int ok, const char *label) {
     checks++;
     if (!ok) { fprintf(stderr, "FAIL %s\n", label); failures++; }
@@ -430,6 +433,25 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 16; ++i) if (wrapped[i] != 0x03e0) wrap_ok = 0;
     check(wrap_ok, "HD wrapped transfer observes following fill");
     check(native[0] == 31, "later draws do not mutate returned snapshot");
+    if (threaded) {
+        static uint16_t deferred_a[1024 * 512], deferred_b[1024 * 512];
+        atomic_int completed;
+        atomic_init(&completed, 0);
+        gr_fill_rect(0, 0, 1024, 512, 31);
+        check(gl_renderer_native_vram_copy_deferred(deferred_a, vram_copy_done, &completed),
+              "first deferred copy admitted");
+        gr_fill_rect(0, 0, 1024, 512, 0x03e0);
+        check(gl_renderer_native_vram_copy_deferred(deferred_b, vram_copy_done, &completed),
+              "second deferred copy admitted");
+        gr_fill_rect(0, 0, 1024, 512, 0x7c00);
+        gl_renderer_native_vram_copy_drain();
+        check(atomic_load_explicit(&completed, memory_order_acquire) == 2,
+              "both deferred copies complete");
+        int exact = 1;
+        for (int i = 0; i < 1024 * 512; ++i)
+            if (deferred_a[i] != 31 || deferred_b[i] != 0x03e0) exact = 0;
+        check(exact && !rt_held(), "deferred snapshots preserve separate command positions");
+    }
     gl_renderer_render_thread_sync("fixture_final_check");
     check(glGetError() == GL_NO_ERROR, "GL error");
     uint64_t batch_diag[9];

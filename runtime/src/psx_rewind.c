@@ -5,6 +5,8 @@
 #include "boot_state.h"
 #include "cdrom.h"
 #include "gpu.h"
+#include "gpu_gl_renderer.h"
+#include "gpu_render.h"
 #include "host_keymap.h"
 #include "host_osd.h"
 #include "interrupts.h"
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #if defined(PSX_HAS_RBENGINE_SNAP)
 #include "retcomm_rbengine/snap_ring.h"
@@ -113,6 +116,8 @@ int psx_rewind_title_blocked(void)
 
 void psx_rewind_set_title_blocked(int blocked) { s_title_blocked = blocked ? 1 : 0; }
 uint32_t psx_rewind_snap_count(void) { return 0; }
+uint32_t psx_rewind_verified_count(void) { return 0; }
+uint32_t psx_rewind_mismatch_count(void) { return 0; }
 void psx_rewind_set_depth(uint32_t depth) { (void)depth; }
 void psx_rewind_set_interval(uint32_t interval) { (void)interval; }
 void psx_rewind_set_enabled(int enabled) { (void)enabled; }
@@ -172,6 +177,20 @@ static uint32_t s_frame;
 static uint32_t s_last_capture_frame = 0xffffffffu;
 static int s_capture_due;
 static int s_configured;
+
+typedef struct RwPending {
+    struct RwPending *next;
+    uint8_t *blob;
+    size_t len;
+    uint16_t *vram;
+    GpuDisplayInfo display;
+    uint32_t tick;
+    atomic_int ready;
+} RwPending;
+static RwPending *s_pending_head, *s_pending_tail;
+static uint32_t s_verified, s_mismatches;
+uint32_t psx_rewind_verified_count(void) { return s_verified; }
+uint32_t psx_rewind_mismatch_count(void) { return s_mismatches; }
 
 static RbeSnapRing *s_ring;
 static RwThumb *s_thumbs;
@@ -353,11 +372,10 @@ static uint32_t rewind_resolve_resume_pc(const CPUState *cpu, uint32_t hint)
     return 0u;
 }
 
-static void capture_thumb(uint32_t *dst)
+static void capture_thumb(uint32_t *dst, const uint16_t *image, const GpuDisplayInfo *display)
 {
-    GpuDisplayInfo di;
+    GpuDisplayInfo di = *display;
     uint32_t dw, dh, x, y;
-    gpu_get_display_info(&di);
     dw = di.width ? di.width : 320u;
     dh = di.height ? di.height : 240u;
     if (di.disabled) {
@@ -368,8 +386,10 @@ static void capture_thumb(uint32_t *dst)
         uint32_t sy = y * dh / RW_THUMB_H;
         for (x = 0; x < RW_THUMB_W; x++) {
             uint32_t sx = x * dw / RW_THUMB_W;
-            dst[y * RW_THUMB_W + x] =
-                gpu_display_pixel_argb(&di, sx, sy) | 0xFF000000u;
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb_in(image, &di, sx, sy, &r, &g, &b);
+            dst[y * RW_THUMB_W + x] = 0xFF000000u |
+                ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
         }
     }
 }
@@ -418,6 +438,44 @@ static void list_push(uint32_t tick, const uint32_t *thumb)
     s_panel_dirty = 1;
 }
 
+static void capture_ready(void *user)
+{
+    RwPending *p = user;
+    atomic_store_explicit(&p->ready, 1, memory_order_release);
+}
+
+/* Only main publishes entries or touches the ring. The render owner writes
+ * exclusively into the pending blob, then release-publishes completion. */
+static void finish_pending(int discard)
+{
+    while (s_pending_head && atomic_load_explicit(&s_pending_head->ready, memory_order_acquire)) {
+        RwPending *p = s_pending_head;
+        s_pending_head = p->next;
+        if (!s_pending_head) s_pending_tail = NULL;
+        if (!discard) {
+            uint32_t thumb[RW_THUMB_W * RW_THUMB_H];
+            capture_thumb(thumb, p->vram, &p->display);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+            for (size_t i = 0; i < 1024u * 512u; ++i)
+                p->vram[i] = (uint16_t)((p->vram[i] >> 8) | (p->vram[i] << 8));
+#endif
+            if (rbe_snap_ring_store(s_ring, p->tick, p->blob, p->len)) {
+                list_push(p->tick, thumb);
+                p->blob = NULL; /* ring owns it */
+            }
+        }
+        free(p->blob);
+        free(p);
+    }
+}
+
+static void drain_pending(int discard)
+{
+    if (!s_pending_head) return;
+    gl_renderer_native_vram_copy_drain();
+    finish_pending(discard);
+}
+
 void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 {
     if (!rewind_wanted())
@@ -448,6 +506,7 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 
 void psx_rewind_shutdown(void)
 {
+    drain_pending(1);
     if (s_ring)
         rbe_snap_ring_destroy(s_ring);
     free(s_thumbs);
@@ -466,6 +525,7 @@ void psx_rewind_shutdown(void)
 
 uint32_t psx_rewind_discard_history(void)
 {
+    drain_pending(1);
     uint32_t dropped = s_count;
     if (!s_configured || !s_ring) return 0;
     rbe_snap_ring_clear(s_ring);
@@ -512,11 +572,7 @@ void psx_rewind_note_frame(void)
 
 static int do_capture(CPUState *cpu, uint32_t resume_pc)
 {
-    uint8_t *blob = NULL;
-    size_t len = 0;
-    uint32_t thumb[RW_THUMB_W * RW_THUMB_H];
     CPUState snap;
-    uint32_t tick = s_frame;
     uint32_t pc;
 
     if (!cpu || !s_ring)
@@ -526,15 +582,40 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         return 0;
     snap = *cpu;
     snap.pc = pc;
-    if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
-        !blob || !len)
-        return 0;
-    if (!rbe_snap_ring_store(s_ring, tick, blob, len)) {
-        free(blob);
+    RwPending *p = calloc(1, sizeof *p);
+    if (!p) return 0;
+    atomic_init(&p->ready, 0);
+    p->tick = s_frame;
+    gpu_get_display_info(&p->display);
+    if (!boot_state_save_buffer_raw_deferred(&snap, s_bios, s_entry,
+                                             &p->blob, &p->len, &p->vram)) {
+        free(p);
         return 0;
     }
-    capture_thumb(thumb);
-    list_push(tick, thumb);
+    /* No guest work occurs between CPU serialization and this queue position.
+     * CPU-authoritative renderers can complete the copy without blocking main.
+     * Other backends retain their exact synchronous transfer semantics. */
+    if (!gl_renderer_native_vram_copy_deferred(p->vram, capture_ready, p)) {
+        gr_vram_transfer_out(0, 0, 1024, 512, p->vram);
+        capture_ready(p);
+    }
+    /* Diagnostic only: compare every serialized byte against the established
+     * synchronous snapshot at the same guest point. Never enabled for timing. */
+    const char *verify = getenv("PSX_REWIND_VERIFY");
+    if (verify && *verify == '1') {
+        uint8_t *reference = NULL;
+        size_t reference_len = 0;
+        gl_renderer_native_vram_copy_drain();
+        int ok = boot_state_save_buffer_raw(&snap, s_bios, s_entry, &reference, &reference_len);
+        s_verified++;
+        if (!ok || reference_len != p->len || memcmp(reference, p->blob, p->len))
+            s_mismatches++;
+        free(reference);
+    }
+    if (s_pending_tail) s_pending_tail->next = p;
+    else s_pending_head = p;
+    s_pending_tail = p;
+    finish_pending(0);
     s_last_capture_frame = s_frame;
     s_capture_due = 0;
     return 1;
@@ -547,6 +628,7 @@ static int do_load(CPUState *cpu, uint32_t tick)
 
     if (!cpu || !s_ring)
         return 0;
+    drain_pending(0);
     if (!psx_hle_scheduler_enabled()) {
         fprintf(stderr, "psxrecomp: rewind load needs HLE scheduler\n");
         return 0;
@@ -575,6 +657,7 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
 {
     if (!psx_rewind_enabled())
         return;
+    finish_pending(0);
     if (s_load_pending) {
         uint32_t tick = s_load_tick;
         s_load_pending = 0;

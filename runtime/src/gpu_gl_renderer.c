@@ -543,7 +543,7 @@ enum {
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN,
-    RTH_VRAM_SYNC_COPY, RTH_GROUP
+    RTH_VRAM_SYNC_COPY, RTH_VRAM_DEFERRED_COPY, RTH_GROUP
 };
 /* Producer-side geometry publication for an optional seam-prepared pass.
  * Collection never reads the render owner's mutable snap index. */
@@ -16097,6 +16097,26 @@ static void rtb_vram_upload_open(int open) {
 }
 static void rtb_hd_texture_note(int op, int x, int y, int w, int h, int sx, int sy) {
     RTH_DIRECT_OR(RTH_REC(RTH_HD_NOTE, 0, op, x, y, w, h, sx, sy)); hd_note_exec(op, x, y, w, h, sx, sy); }
+typedef struct RthVramCopy {
+    uint16_t *out;
+    void (*done)(void*);
+    void *user;
+} RthVramCopy;
+int gl_renderer_native_vram_copy_deferred(uint16_t *out, void (*done)(void*), void *user) {
+    if (!out || !done || !s_hd_native_authority || rt_batch_active() || !rth_record_mode())
+        return 0;
+    if (!rth_group_flush()) return 0;
+    RthVramCopy *p = rt_cmd_begin(RTH_VRAM_DEFERRED_COPY, 0, sizeof *p);
+    if (!p) return 0;
+    p->out = out; p->done = done; p->user = user;
+    rt_cmd_commit();
+    return 1;
+}
+void gl_renderer_native_vram_copy_drain(void) {
+    if (!s_rth_on || rt_on_render_thread()) return;
+    rth_group_flush();
+    rt_drain();
+}
 static void rtb_vram_transfer_out(int x, int y, int w, int h, uint16_t *d) {
     if (!d || w <= 0 || h <= 0) return;
     /* Under HD authority, native rasterization already produced the exact
@@ -16583,6 +16603,13 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     case RTH_VRAM_SYNC_COPY:
         memcpy(s_rth_vram_pub, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
         break;
+    case RTH_VRAM_DEFERRED_COPY: {
+        RthVramCopy copy;
+        memcpy(&copy, payload, sizeof copy);
+        memcpy(copy.out, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+        copy.done(copy.user);
+        break;
+    }
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);
         (void)gl_renderer_fbo_peek(v[0], v[1], v[2], v[3], (uint16_t *)(uintptr_t)ptr);

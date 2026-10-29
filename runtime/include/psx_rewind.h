@@ -49,6 +49,8 @@ void psx_rewind_set_title_blocked(int blocked);
 int  psx_rewind_title_blocked(void);
 /* Snapshots in the ring (debug/status). */
 uint32_t psx_rewind_snap_count(void);
+uint32_t psx_rewind_verified_count(void);
+uint32_t psx_rewind_mismatch_count(void);
 int  psx_rewind_is_open(void);
 /* 1 while open or slide animation still visible. */
 int  psx_rewind_needs_present(void);

@@ -6,6 +6,7 @@
 
 static uint8_t ram[2*1024*1024], spad[1024], spuram[512*1024];
 static uint16_t vram[1024*512];
+const uint16_t *gpu_get_vram(void) { return vram; }
 static int boot_clears, cd_handoffs;
 uint32_t i_stat, i_mask, g_psx_icache_tv[1024];
 uint64_t psx_cycle_count;
@@ -81,6 +82,17 @@ int main(void) {
         fntrace_restore_game_started(started);
         assert(compressed ? boot_state_save_buffer(&cpu,123,0x801b0000,&saved,&len)
                           : boot_state_save_buffer_raw(&cpu,123,0x801b0000,&saved,&len));
+        if (!compressed) {
+            uint8_t *pending = NULL; size_t pending_len = 0;
+            uint16_t *reserved = NULL;
+            assert(boot_state_save_buffer_raw_deferred(&cpu,123,0x801b0000,
+                                                       &pending,&pending_len,&reserved));
+            assert((uint8_t*)reserved >= pending &&
+                   (uint8_t*)(reserved + 1024*512) <= pending + pending_len);
+            memcpy(reserved, vram, sizeof vram);
+            assert(pending_len == len && !memcmp(pending, saved, len));
+            free(pending);
+        }
         const size_t handoff=handoff_section(saved,len), count=r32(saved+28);
         assert(saved[4]==9 && saved[handoff+16]==started);
         fntrace_restore_game_started(!started); ram[0x100]=0; cpu.pc=0;

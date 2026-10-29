@@ -213,6 +213,15 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-28 (`fix/queued-vram-snapshot`, WIP):** CPU-authoritative VRAM
+  transfers retain render-context ownership. Deferred rewind snapshots capture
+  CPU/device state on main and queue the matching private VRAM copy, publishing
+  only after completion. Hidden GL ownership/order fixtures and serializer
+  equality unit test passed; integrated deferred-snapshot validation and
+  performance acceptance are unfinished. Owner stopped implementation and
+  measurements to request an end-to-end frame-pipeline map in R4's
+  `docs/FRAME_PIPELINE.md`. No guest timing changes; no merge or installation.
+
 - **2026-10-28 (`fix/race-cadence-metrics`):** Added opt-in native debug TCP
   `main_cadence` counters for main-thread VBlank callback wall intervals and
   pre-offline-pacer deadline debt, with an explicit reset/start command.

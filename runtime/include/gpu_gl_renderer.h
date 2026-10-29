@@ -702,6 +702,11 @@ void gl_renderer_set_present_thread(int on, int slots);
 int  gl_renderer_present_thread_active(void);
 int  gl_renderer_present_thread_json(char *out, size_t cap);
 int  gl_renderer_fbo_peek_deferred(int x, int y, int w, int h, uint16_t *out);
+/* Queue an exact full native VRAM copy under CPU authority. Returns zero if
+ * unavailable (nothing queued). out/user live until done(user), which executes
+ * on the render owner; callback must not call runtime/guest APIs. */
+int gl_renderer_native_vram_copy_deferred(uint16_t *out, void (*done)(void*), void *user);
+void gl_renderer_native_vram_copy_drain(void);
 void gl_renderer_ring_capture(uint32_t frame, int wide, int base_x, int disp_y, int disp_h,
                               int cx, int cy, int cw, int ch);
 
