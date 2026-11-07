@@ -30,6 +30,11 @@
  * surface), and with the thread on its record/acquire counters.
  * Original source-owned scene; no retail payload. */
 #define PSX_TEST_HD_TRACKING 1
+/* Raw-target reference fixtures compare raster math independently of the
+ * production allocation policy. Dedicated pipeline fixtures set this to0. */
+#ifndef PSX_GL_TEST_REFERENCE_TARGET
+#define PSX_GL_TEST_REFERENCE_TARGET 1
+#endif
 #include "gpu_gl_renderer.c"
 #include "gl_postfx_projection_fixture.h"
 #include "gl_fmv_fixture.h"

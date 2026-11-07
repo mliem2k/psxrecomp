@@ -8,6 +8,26 @@ static unsigned surface_owner_at(int x,int y) {
     }
     return 0;
 }
+static GLuint surface_pool_read_target(int x,int y,int w,int h,int *rx,int *ry) {
+    const GlCoverage *coverage=&s_region_pool.coverage;
+    for(size_t i=0;i<coverage->count;++i) {
+        const GlCoverageRect *r=coverage->rects+i;
+        if(r->owner && r->x<=x && r->y<=y && r->x+r->w>=x+w && r->y+r->h>=y+h) {
+            const GlRasterSurface *s=s_region_pool.surfaces[r->owner];
+            *rx=x-s->x;*ry=y-s->y;return s->fbo;
+        }
+    }
+    GlCopyRegion *regions=malloc(coverage->count*sizeof *regions);
+    if(!regions)abort();int count=0;
+    for(size_t i=0;i<coverage->count;++i) {
+        const GlCoverageRect *r=coverage->rects+i;
+        if(!r->owner || r->x>=x+w || r->y>=y+h || r->x+r->w<=x || r->y+r->h<=y)continue;
+        const GlRasterSurface *s=s_region_pool.surfaces[r->owner];
+        regions[count++]=(GlCopyRegion){s->fbo,r->x,r->y,r->w,r->h,s->allocation_scale,r->x-s->x,r->y-s->y};
+    }
+    gpu_copy_gather(regions,count,1,x,y,w,h,s_out_scale);free(regions);
+    *rx=*ry=0;return s_scratch_fbo;
+}
 static void surface_pool_copy(int sx,int sy,int dx,int dy,int w,int h) {
     if(w<=0 || h<=0)return;
     if(w>VRAM_W)w=VRAM_W;if(h>VRAM_H)h=VRAM_H;

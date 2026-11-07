@@ -80,6 +80,13 @@ static void pool_regions(int scale) {
     GlRasterSurface *shifted=surface_pool_display(&pool,0,0,320,240,426,53,80,scale);
     check(shifted && shifted->x==-133 && shifted->w==426 && shifted->h==240,
         "shifted display keeps only its physical output extent");
+    int resized=scale==18?9:scale+1;
+    check(surface_pool_rescale(&pool,resized),"rescale all allocated regions transactionally");
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,output->fbo);
+    glReadPixels((300-output->x)*resized,220*resized,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    glReadPixels((300-output->x)*resized,220*resized,1,1,GL_STENCIL_INDEX,GL_UNSIGNED_BYTE,&stencil);
+    check(output->allocation_scale==resized && pixels[0]==248 && pixels[3]==255 && stencil==1,
+        "region rescale preserves colour and mask without a native round trip");
     surface_pool_destroy(&pool);
     memcpy(s_vram,saved,1024*512*sizeof *saved);free(saved);
     native_texture_upload_rect(0,0,1024,512);
@@ -200,6 +207,12 @@ static void routed_wide(int scale) {
         check(pixel[0]==248 && !pixel[1] && !pixel[2],"selected wide target receives canonical geometry");
     }
     check(pages[0]!=pages[1] && s_region_pool.count==3,"vertical buffering retains two display bands only");
+    glb_wide_feedback_rect(0,60,60,160,300,8,8,128,128,128,1,-1);
+    glb_wide_feedback_rect(0,160,300,180,320,8,8,128,128,128,1,-1);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,pages[1]);
+    uint8_t feedback[4];glReadPixels(234*scale,81*scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,feedback);
+    check(feedback[0]==248 && !feedback[1] && !feedback[2] && feedback[3]==255,
+        "cropped feedback supports independent bands and same-target scratch rectangles");
     check(present_wide_fbo_impl(0,0,240,0)==1 && present_wide_fbo_impl(0,240,240,0)==1,
         "presentation finds each cropped display independently of current draw target");
     check(glGetError()==GL_NO_ERROR,"cropped display presentation GL state");

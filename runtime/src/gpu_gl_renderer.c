@@ -900,6 +900,7 @@ static int s_selected_bank_failed;
 typedef struct GlRasterSurface {
     GLuint tex,fbo,rb;
     int x,y,w,h,allocation_scale;
+    int display,display_base;
 } GlRasterSurface;
 typedef struct GlSurfacePool {
     GlCoverage coverage;
@@ -907,6 +908,7 @@ typedef struct GlSurfacePool {
     size_t count,capacity;
 } GlSurfacePool;
 static GlSurfacePool s_region_pool;
+static _Atomic uint64_t s_surface_stats[4]; /* allocations, pixels, bytes, largest pixels */
 typedef struct GlDrawRegion {
     GlRasterSurface *surface;
     int x,y,w,h,direct;
@@ -923,6 +925,7 @@ static void surface_stencil_rebuild(void);
 static void surface_pool_copy(int sx,int sy,int dx,int dy,int w,int h);
 static int s_pool_wide_enabled;
 static void surface_wide_select(void);
+static void feedback_program_release(void);
 static GlRasterSurface s_primary_surface={0,0,0,0,0,VRAM_W,VRAM_H,0};
 static GlRasterSurface *s_draw_surface=&s_primary_surface;
 #define s_hr_tex (s_draw_surface->tex)
@@ -6904,7 +6907,13 @@ static void free_hr_targets(void) {
 static int alloc_hr_targets(int S) {
     int hw = VRAM_W * S, hh = VRAM_H * S;
     s_hr_alloc=0;
+#if defined(PSX_GL_TEST_REFERENCE_TARGET) && PSX_GL_TEST_REFERENCE_TARGET
     if(!raster_surface_alloc(VRAM_W,VRAM_H,S,&s_hr_tex,&s_hr_rb,&s_hr_fbo))return 0;
+#else
+    s_draw_surface=&s_primary_surface;
+    s_primary_surface=(GlRasterSurface){0,0,0,0,0,VRAM_W,VRAM_H,S};
+    if(!surface_pool_init(&s_region_pool))return 0;
+#endif
     /* Copy/stencil scratch. Up to 2x it covers the whole surface as before
      * (<= 8 MiB); above that it starts at one tile and grows to the largest
      * copy on demand (scratch_ensure), instead of costing 4 MiB*S^2 up front. */
@@ -6945,6 +6954,7 @@ static int init_gpu_raster(void) {
             if (v > 0 && (s_gl_max_dim == 0 || v < s_gl_max_dim)) s_gl_max_dim = v;
         }
         s_vram_budget = psx_gl_budget_bytes_from_env(getenv("PSX_GL_VRAM_BUDGET_MB"));
+#if defined(PSX_GL_TEST_REFERENCE_TARGET) && PSX_GL_TEST_REFERENCE_TARGET
         s_out_scale = psx_gl_clamp_full_vram_scale(s_req_scale, GL_MAX_INTERNAL_SCALE,
                                                s_gl_max_dim, s_vram_budget,
                                                &s_scale_clamp_reason);
@@ -6989,6 +6999,16 @@ static int init_gpu_raster(void) {
                     (s_scale_clamp_reason & PSX_GL_SCALE_BUDGET) ? "memory budget " : "",
                     (s_scale_clamp_reason & PSX_GL_SCALE_CEILING) ? "ceiling " : "",
                     s_gl_max_dim, (unsigned long long)(s_vram_budget >> 20));
+#else
+        s_out_scale=s_hr_scale=s_req_scale;
+        s_scale_clamp_reason=0;s_hiw=0;
+        memset(s_hiw_t,0,sizeof s_hiw_t);s_hiw_n=0;
+        s_hiw_last_x0=s_hiw_last_x1=0;
+        s_hiw_scratch_tex=s_hiw_scratch_fbo=0;
+        s_hiw_scratch_w=s_hiw_scratch_h=0;
+        s_hiw_refused_logged=s_hiw_scratch_refused_logged=s_scratch_refused_logged=0;
+        s_hiw_grows=0;
+#endif
         s_scale_alloc_retries = 0;
     }
 
@@ -7027,6 +7047,7 @@ static int init_gpu_raster(void) {
     /* The hr surface: step the scale down inside GL when the driver cannot
      * allocate it (out of memory, or a limit it under-reported). Only a
      * failure at 1x takes the whole backend down, as before. */
+#if defined(PSX_GL_TEST_REFERENCE_TARGET) && PSX_GL_TEST_REFERENCE_TARGET
     while (!alloc_hr_targets(s_hr_scale)) {
         if (s_hr_scale <= 1) return 0;
         fprintf(stdout, "psxrecomp: GL hr surface %dx%d (%dx) failed to allocate; "
@@ -7036,6 +7057,9 @@ static int init_gpu_raster(void) {
         s_out_scale = s_hr_scale;
         s_scale_alloc_retries++;
     }
+#else
+    if(!alloc_hr_targets(s_hr_scale))return 0;
+#endif
     if (!make_fbo(&s_raw_fbo, s_raw_tex, 0)) return 0;
     if (s_hiw) {
         /* The window's copy staging; grown on demand (hiw_mirror_copy). */
@@ -7200,6 +7224,7 @@ static int init_gpu_raster(void) {
     p_glGenVertexArrays(1, &s_empty_vao);
     p_glBindVertexArray(0);
 
+    if(s_hr_fbo) {
     /* Clear the authoritative surface (color + stencil) and queue a full
      * upload of whatever the CPU VRAM already holds (pre-context software
      * draws, BIOS logo state, ...). */
@@ -7210,6 +7235,7 @@ static int init_gpu_raster(void) {
     glStencilMask(0xFF);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    }
     rect_clear(&s_pack_dirty);
     rect_clear(&s_stencil_stale);
     s_up_nrects = 0;
@@ -7225,7 +7251,7 @@ static int init_gpu_raster(void) {
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         s_wide_tex[i] = 0; s_wide_fbo[i] = 0; s_wide_base[i] = -1;
     }
-    g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cur_base = 0;
+    g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cur_base = 0;s_pool_wide_enabled=0;
 
     s_raster_ok = 1;
     dyn_context_ready();
@@ -7272,8 +7298,8 @@ int gl_renderer_scale_info(GlScaleInfo *out) {
     out->clamp_reason = s_scale_clamp_reason;
     out->alloc_retries = s_scale_alloc_retries;
     out->budget_mib = (int)(s_vram_budget >> 20);
-    out->fbo_w = s_raster_ok ? VRAM_W * s_hr_alloc : 0;
-    out->fbo_h = s_raster_ok ? VRAM_H * s_hr_alloc : 0;
+    out->fbo_w = s_raster_ok && s_hr_fbo ? s_hr_width * s_hr_alloc : 0;
+    out->fbo_h = s_raster_ok && s_hr_fbo ? s_hr_height * s_hr_alloc : 0;
     out->hr_scale = s_raster_ok ? s_hr_scale : 0;
     out->windowed = s_hiw;
     {
@@ -7326,7 +7352,9 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
     flush_cpu_upload();
     GLuint fbo = s_hr_fbo;
     int rx = x-s_hr_origin_x,ry=y-s_hr_origin_y;
-    if (s_hiw) {
+    if(s_region_pool.coverage.rects) {
+        fbo=surface_pool_read_target(x,y,w,h,&rx,&ry);
+    } else if (s_hiw) {
         /* Windowed: the S-scaled pixels exist only inside the tiles. */
         hiw_flush_queue();
         const HiwTile *T = hiw_on() ? hiw_tile_holding(x, x + w) : NULL;
@@ -7509,6 +7537,10 @@ int gl_renderer_init_context(SDL_Window *win) {
     if (ok) ok = init_gpu_raster();
     if (!ok) {
         fprintf(stdout, "psxrecomp: GL pipeline init failed — falling back to software renderer\n");
+        s_draw_surface=&s_primary_surface;
+        surface_pool_destroy(&s_region_pool);
+        free(s_draw_regions);s_draw_regions=NULL;s_draw_region_count=s_draw_region_capacity=0;
+        s_primary_surface=(GlRasterSurface){0,0,0,0,0,VRAM_W,VRAM_H,0};
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
         s_raster_ok = 0;
         return 0;
@@ -7559,6 +7591,7 @@ void gl_renderer_shutdown(void) {
     s_native_surface_enabled=s_native_surface_pending=0;
     gl_renderer_clear_hd_texture_cache();
     pass_resources_release();
+    feedback_program_release();
     if (s_ctx) {
         for (unsigned i = 1; i < 65536u; ++i)
             if (s_bank_tex[i]) glDeleteTextures(1, &s_bank_tex[i]);
@@ -8266,13 +8299,14 @@ static const char *FB_FS =
     "out vec4 frag;\n"
     "uniform sampler2D u_src;\n"
     "uniform float u_dst_scale; /* target px per native px */\n"
+    "uniform float u_src_scale;\n"
     "uniform vec2 u_src_delta;  /* source minus target, native px */\n"
     "uniform vec3 u_mod;        /* 8-bit modulation colour */\n"
     "uniform int u_raw;\n"
     "uniform int u_accurate;    /* the surfaces' colour basis, as TEX_FS */\n"
     "void main(){\n"
     "  vec2 n = gl_FragCoord.xy / u_dst_scale + u_src_delta;\n"
-    "  float ss = float(textureSize(u_src, 0).y) / 512.0;\n"
+    "  float ss = u_src_scale;\n"
     "  vec4 c = texelFetch(u_src, ivec2(n * ss), 0);\n"
     "  if (c.a < 0.5 && c.rgb == vec3(0.0)) discard;   /* texel 0x0000 */\n"
     "  /* The centre samples packed 5-bit VRAM (PACK_FS); truncating the same\n"
@@ -8286,7 +8320,11 @@ static const char *FB_FS =
     "}\n";
 static GLuint s_fb_prog = 0;
 static GLint  s_fb_uRect, s_fb_uSize, s_fb_uSrc, s_fb_uDstScale, s_fb_uSrcDelta,
-              s_fb_uMod, s_fb_uRaw, s_fb_uAccurate;
+              s_fb_uMod, s_fb_uRaw, s_fb_uAccurate,s_fb_uSrcScale;
+static void feedback_program_release(void) {
+    if(s_ctx && s_fb_prog)p_glDeleteProgram(s_fb_prog);
+    s_fb_prog=0;
+}
 
 static int fb_prog_ready(void) {
     if (s_fb_prog) return 1;
@@ -8296,6 +8334,7 @@ static int fb_prog_ready(void) {
     s_fb_uSize      = p_glGetUniformLocation(s_fb_prog, "u_size");
     s_fb_uSrc       = p_glGetUniformLocation(s_fb_prog, "u_src");
     s_fb_uDstScale  = p_glGetUniformLocation(s_fb_prog, "u_dst_scale");
+    s_fb_uSrcScale  = p_glGetUniformLocation(s_fb_prog, "u_src_scale");
     s_fb_uSrcDelta  = p_glGetUniformLocation(s_fb_prog, "u_src_delta");
     s_fb_uMod       = p_glGetUniformLocation(s_fb_prog, "u_mod");
     s_fb_uRaw       = p_glGetUniformLocation(s_fb_prog, "u_raw");
@@ -8314,6 +8353,7 @@ static void fb_bind(GLuint src_tex, int dl, int dy, int w, int h, int sl, int sy
     p_glUniform4f(s_fb_uRect, (float)dl, (float)dy, (float)(dl + w), (float)(dy + h));
     p_glUniform2f(s_fb_uSize, (float)g_wide_w, (float)VRAM_H);
     p_glUniform1f(s_fb_uDstScale, (float)s_out_scale);
+    p_glUniform1f(s_fb_uSrcScale, (float)s_out_scale);
     p_glUniform2f(s_fb_uSrcDelta, (float)(sl - dl), (float)(sy - dy));
     p_glUniform3f(s_fb_uMod, (float)r, (float)g, (float)b);
     p_glUniform1i(s_fb_uRaw, raw);
@@ -8329,10 +8369,49 @@ static int wide_index_existing(int base_x) {
 
 static void glb_wide_feedback_rect(int src_base, int src_x, int src_y, int dst_x, int dst_y,
                                    int w, int h, int r, int g, int b, int raw, int semi) {
+    surface_wide_select();
     if (!s_raster_ok || !g_wide_cur || w <= 0 || h <= 0 || g_wide_w <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
     hiw_flush_queue();   /* queued mirrors land in both surfaces first */
+    if(s_region_pool.coverage.rects) {
+        GlRasterSurface *dst=surface_pool_find(&s_region_pool,g_wide_cur);
+        GlRasterSurface *src=surface_pool_display_find(&s_region_pool,src_base,src_y,h);
+        if(!src || !dst || !fb_prog_ready())return;
+        int dl=dst_x-dst->x,dy=dst_y-dst->y,sl=src_x-src->x,sy=src_y-src->y;
+        int left=0,top=0;
+        if(sl<0)left=-sl;if(dl<view_pad_left && view_pad_left-dl>left)left=view_pad_left-dl;
+        if(sy<0)top=-sy;if(dy<0 && -dy>top)top=-dy;
+        if(dst_y<s_area_y1 && s_area_y1-dst_y>top)top=s_area_y1-dst_y;
+        dl+=left;sl+=left;dy+=top;sy+=top;w-=left;h-=top;
+        if(sl+w>src->w)w=src->w-sl;
+        if(dl+w>dst->w-view_pad_right)w=dst->w-view_pad_right-dl;
+        if(sy+h>src->h)h=src->h-sy;if(dy+h>dst->h)h=dst->h-dy;
+        if(dst->y+dy+h>s_area_y2+1)h=s_area_y2+1-dst->y-dy;
+        if(w<=0 || h<=0)return;
+        GLuint texture=src->tex;int source_scale=src->allocation_scale;
+        if(src==dst) {
+            if(!scratch_ensure(w*source_scale,h*source_scale))abort();
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,src->fbo);
+            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,s_scratch_fbo);glDisable(GL_SCISSOR_TEST);
+            p_glBlitFramebuffer(sl*source_scale,sy*source_scale,(sl+w)*source_scale,(sy+h)*source_scale,
+                0,0,w*source_scale,h*source_scale,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+            texture=s_scratch_tex;sl=sy=0;
+        }
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,dst->fbo);
+        glViewport(0,0,dst->w*s_out_scale,dst->h*s_out_scale);
+        glDisable(GL_SCISSOR_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_DEPTH_TEST);
+        fb_bind(texture,dl,dy,w,h,sl,sy,r,g,b,raw);
+        p_glUniform2f(s_fb_uSize,(float)dst->w,(float)dst->h);
+        p_glUniform1f(s_fb_uSrcScale,(float)source_scale);
+        if(semi>=0)apply_psx_blend(semi);else glDisable(GL_BLEND);
+        glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+        rect_add(&s_stencil_stale,dst_x,dst_y,dst_x+w-1,dst_y+h-1);s_stencil_valid=0;
+        glBindTexture(GL_TEXTURE_2D,0);glDisable(GL_BLEND);
+        p_glBlendEquationSeparate(PSXGL_FUNC_ADD,PSXGL_FUNC_ADD);
+        p_glBindVertexArray(0);p_glUseProgram(0);p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+        return;
+    }
     const int si = wide_index_existing(src_base);
     if (si < 0 || s_wide_fbo[si] == g_wide_cur || !fb_prog_ready()) return;
     const int dl = dst_x + wide_dx();
@@ -8372,6 +8451,15 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
                                    int disp_y, int disp_h) {
     if (!s_raster_ok || !s_ctx || g_wide_w <= 0) return 0;
     GLuint fbo = 0;
+    int source_y=disp_y,source_h=VRAM_H;
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,base_x,disp_y,
+            g_wide_w-2*g_wide_off,disp_h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)return 0;
+        fbo=surface->fbo;source_y=disp_y-surface->y;source_h=surface->h;
+    }
+    if(!s_region_pool.coverage.rects)
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == base_x) { fbo = s_wide_fbo[i]; break; }
     if (!fbo) return 0;
@@ -8384,12 +8472,11 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     flush_cpu_upload();
     hiw_flush_queue();   /* windowed: queued wide mirrors */
     wide_blit_center(fbo, base_x, disp_y, disp_h);   /* fast-path: authoritative centre before readback */
-    glFinish();
 
     int W = g_wide_w * s_out_scale;
-    int H = VRAM_H * s_out_scale;
+    int H = source_h * s_out_scale;
     int out_h = disp_h * s_out_scale;
-    int ry0 = disp_y * s_out_scale;
+    int ry0 = source_y * s_out_scale;
     if (ry0 < 0) ry0 = 0;
     if (ry0 + out_h > H) out_h = H - ry0;
     if (out_h <= 0) return 0;
@@ -9269,6 +9356,7 @@ static int      s_pb_raw_w = 0, s_pb_raw_h = 0;
 static GLuint   s_pb_wide_tex = 0, s_pb_wide_rb = 0, s_pb_wide_fbo = 0;
 static int      s_pb_wide_w = 0, s_pb_wide_h = 0;
 static GLuint   s_pb_wide_src = 0;
+static GlRasterSurface *s_pb_surface;
 /* The backup above still equals VRAM (the last pass restored it): rect and
  * scale it was taken at. A later pass of the same frame reuses it. */
 static int      s_pb_valid = 0;
@@ -9840,8 +9928,12 @@ int gl_renderer_pass_verify_vram(void) {
     GL_RT_SYNC("pass_verify_vram"); return s_pv_ok; }
 
 
-static GLuint pass_wide_fbo_for(int base_x) {
+static GLuint pass_wide_fbo_for(int base_x,int y,int h) {
     if (g_wide_w <= 0) return 0;
+    if(s_region_pool.coverage.rects) {
+        GlRasterSurface *surface=surface_pool_display_find(&s_region_pool,base_x,y,h);
+        return surface?surface->fbo:0;
+    }
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == base_x) return s_wide_fbo[i];
     return 0;
@@ -9923,7 +10015,7 @@ static void pass_capture_into(GLuint tex, const PassGen *g) {
     int S = s_hr_scale;
     hiw_flush_queue();   /* queued wide mirrors land before the capture reads */
     if (g->source_path == GL_PRES_WIDE) {
-        GLuint wf = pass_wide_fbo_for(g->x);
+        GLuint wf = pass_wide_fbo_for(g->x,g->y,g->h);
         int native_w = g_wide_w - 2 * g_wide_off;
         if (!wf) return;
         if (wide_center_is_canonical() && native_w > 0) {
@@ -9940,12 +10032,13 @@ static void pass_capture_into(GLuint tex, const PassGen *g) {
         }
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, wf);
         glBindTexture(GL_TEXTURE_2D, tex);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, g->y * S,
+        GlRasterSurface *surface=surface_pool_find(&s_region_pool,wf);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, (g->y-(surface?surface->y:0)) * S,
                             g_wide_w * S, g->h * S);
     } else {
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
         glBindTexture(GL_TEXTURE_2D, tex);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g->x * S, g->y * S,
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (g->x-s_hr_origin_x) * S, (g->y-s_hr_origin_y) * S,
                             g->w * S, g->h * S);
     }
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -9962,7 +10055,7 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
     }
     const PassGen *g=&s_pgen[s_pgen_write];
     int is_wide=g->source_path==GL_PRES_WIDE, S=s_hr_scale;
-    GLuint source=is_wide ? pass_wide_fbo_for(g->x) : s_hr_fbo;
+    GLuint source=is_wide ? pass_wide_fbo_for(g->x,g->y,g->h) : s_hr_fbo;
     if(!g->valid || !source || g->tex_w<=0 || g->tex_h<=0) {
         fprintf(stderr,"pass_debug_capture: source valid=%d source=%u size=%dx%d scale=%d\n",
             g->valid,(unsigned)source,g->tex_w,g->tex_h,S); return 0;
@@ -9986,7 +10079,10 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
     glBindTexture(GL_TEXTURE_2D,temp);
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,g->tex_w,g->tex_h,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,source);
-    glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,is_wide?0:g->x*S,g->y*S,g->tex_w,g->tex_h);
+    GlRasterSurface *capture_surface=surface_pool_find(&s_region_pool,source);
+    int capture_y=g->y-(capture_surface?capture_surface->y:0);
+    int capture_x=is_wide?0:g->x-(capture_surface?capture_surface->x:s_hr_origin_x);
+    glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,capture_x*S,capture_y*S,g->tex_w,g->tex_h);
     if(is_wide && wide_center_is_canonical()) {
         int native_w=g_wide_w-2*g_wide_off;
         if(native_w>0) {
@@ -10011,11 +10107,9 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
 }
 #endif
 
-static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
+static void pass_blit_local(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                       int w, int h, GLbitfield mask) {
     hiw_flush_queue();   /* queued wide mirrors land before a copy reads or writes */
-    if(src==s_hr_fbo){sx-=s_hr_origin_x*s_hr_scale;sy-=s_hr_origin_y*s_hr_scale;}
-    if(dst==s_hr_fbo){dx-=s_hr_origin_x*s_hr_scale;dy-=s_hr_origin_y*s_hr_scale;}
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
     glDisable(GL_SCISSOR_TEST);
@@ -10023,6 +10117,11 @@ static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                         GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+}
+static void pass_blit(GLuint src,GLuint dst,int sx,int sy,int dx,int dy,int w,int h,GLbitfield mask) {
+    if(src==s_hr_fbo){sx-=s_hr_origin_x*s_hr_scale;sy-=s_hr_origin_y*s_hr_scale;}
+    if(dst==s_hr_fbo){dx-=s_hr_origin_x*s_hr_scale;dy-=s_hr_origin_y*s_hr_scale;}
+    pass_blit_local(src,dst,sx,sy,dx,dy,w,h,mask);
 }
 
 static void pass_verify_read(uint8_t **hr, size_t *hr_cap, uint8_t **raw,
@@ -10191,7 +10290,16 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     flush_cpu_upload();
 
     wide = s_interp_source_path == GL_PRES_WIDE && g_wide_w > 0 &&
-           pass_wide_fbo_for(x) != 0;
+           pass_wide_fbo_for(x,y,h) != 0;
+    if(s_region_pool.coverage.rects) {
+        GlRasterSurface *target=wide?surface_pool_display_find(&s_region_pool,x,y,h):NULL;
+        if(!target) {
+            unsigned owner=surface_pool_acquire(&s_region_pool,x,y,w,h,x,y,w,h,S,0);
+            if(!owner)return pass_begin_refuse("region_target");
+            target=s_region_pool.surfaces[owner];
+        }
+        s_draw_surface=s_pb_surface=target;
+    }
     /* Capture what the presenter captures of a displayed buffer: its crop
      * (the VRAM path) applied to the pass rect. Temporal passes only: a
      * stereo pair and the netplay local view keep the plugin's rect. */
@@ -10240,7 +10348,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
      * guest code ran since: VRAM and the coherency state already equal it. */
     if (reuse_backup && s_pb_valid && s_pb_x == x && s_pb_y == y &&
         s_pb_w == w && s_pb_h == h && s_pb_scale == S &&
-        s_pb_wide_src == (g_wide_w > 0 ? pass_wide_fbo_for(x) : 0)) {
+        s_pb_wide_src == (g_wide_w > 0 ? pass_wide_fbo_for(x,y,h) : 0)) {
         s_pb_reused++;
         goto backed_up;
     }
@@ -10270,14 +10378,15 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     pass_blit(s_hr_fbo, s_pb_hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
               GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
     if (!s_async_exec) pass_blit(s_raw_fbo, s_pb_raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
-    s_pb_wide_src = g_wide_w > 0 ? pass_wide_fbo_for(x) : 0;
+    s_pb_wide_src = g_wide_w > 0 ? pass_wide_fbo_for(x,y,h) : 0;
     if (s_pb_wide_src) {
         s_pass_begin_diag.resource = "backup_wide";
         if (!pass_make_color_fbo(&s_pb_wide_tex, &s_pb_wide_rb, &s_pb_wide_fbo,
                                  &s_pb_wide_w, &s_pb_wide_h, g_wide_w * S,
                                  h * S, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
             return pass_begin_refuse("backup_wide");
-        pass_blit(s_pb_wide_src, s_pb_wide_fbo, 0, y * S, 0, 0, g_wide_w * S,
+        GlRasterSurface *surface=surface_pool_find(&s_region_pool,s_pb_wide_src);
+        pass_blit_local(s_pb_wide_src, s_pb_wide_fbo, 0, (y-(surface?surface->y:0)) * S, 0, 0, g_wide_w * S,
                   h * S, GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
     }
     if (!s_async_exec && s_pb_cpu_cap < (size_t)w * (size_t)h) {
@@ -10328,14 +10437,16 @@ static void transaction_restore_ex(int keep_color) {
                                           : GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT) | pass_depth_bit();
     (void)gi;
     if (!s_pass_active) return;
+    if(s_region_pool.coverage.rects && s_pb_surface)s_draw_surface=s_pb_surface;
     /* Roll the journal, then the rect back. */
     pass_journal_rollback();
     pass_blit(s_pb_hr_fbo, s_hr_fbo, 0, 0, s_pass_x * S, s_pass_y * S,
               s_pass_w * S, s_pass_h * S, hr_bits);
     if (!s_async_exec) pass_blit(s_pb_raw_fbo, s_raw_fbo, 0, 0, s_pass_x, s_pass_y, s_pass_w,
               s_pass_h, GL_COLOR_BUFFER_BIT);
-    if (s_pb_wide_src && s_pb_wide_src == pass_wide_fbo_for(s_pass_x)) {
-        pass_blit(s_pb_wide_fbo, s_pb_wide_src, 0, 0, 0, s_pass_y * S,
+    if (s_pb_wide_src && s_pb_wide_src == pass_wide_fbo_for(s_pass_x,s_pass_y,s_pass_h)) {
+        GlRasterSurface *surface=surface_pool_find(&s_region_pool,s_pb_wide_src);
+        pass_blit_local(s_pb_wide_fbo, s_pb_wide_src, 0, 0, 0, (s_pass_y-(surface?surface->y:0)) * S,
                   g_wide_w * S, s_pass_h * S, hr_bits);
         /* The backed-up stencil may predate a rebuild inside the pass. */
         wst_add(wide_index(s_pb_wide_src), 0, s_pass_y, g_wide_w, s_pass_y + s_pass_h);
@@ -10391,7 +10502,7 @@ static void transaction_restore(void) { transaction_restore_ex(0); }
 
 uint32_t gl_renderer_local_view_unavailable(void) {
     pass_refusal_init();
-    if (!s_ctx || !s_raster_ok || !s_hr_fbo || gpu_display_is_depth24())
+    if (!s_ctx || !s_raster_ok || (!s_hr_fbo && !s_region_pool.coverage.rects) || gpu_display_is_depth24())
         return PSX_MOD_RENDER_PASS_NO_PRESENTER;
     /* Only a presenter surface separate from the authoritative VRAM can hold
      * a peer's own image; the high-resolution window presents other tiles. */
@@ -10796,7 +10907,7 @@ static void async_vram_leave(void) {
 uint32_t gl_renderer_stereo_unavailable(void) {
     GL_RT_SYNC("stereo_unavailable");
     pass_refusal_init();
-    if (!s_ctx || !s_raster_ok || !s_hr_fbo || ctx_depth24())
+    if (!s_ctx || !s_raster_ok || (!s_hr_fbo && !s_region_pool.coverage.rects) || ctx_depth24())
         return PSX_MOD_RENDER_PASS_NO_PRESENTER;
     if (s_cpu_auth_dual || s_hd_native_authority || s_hiw || g_wide_w > 0 || s_pass_force_refuse > 0)
         return PSX_MOD_RENDER_PASS_BACKEND;
@@ -12570,7 +12681,7 @@ static float present_alloc_extent(int units, int scale) {
     return (float)units * (float)as / (float)scale;
 }
 
-static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
+static void present_vram_surface_impl(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     /* The crop a pass applies (transaction_begin), taken on the emulation
      * thread at the call: a render-thread replay of this present keeps it. */
@@ -12698,6 +12809,19 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
     s_last_dx = disp_x; s_last_dy = disp_y; s_last_dw = w; s_last_dh = h;
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
 }
+static void present_vram_impl(int x,int y,int w,int h,int linear,int force_4_3) {
+    if(!s_region_pool.coverage.rects || rth_record_mode()) {
+        present_vram_surface_impl(x,y,w,h,linear,force_4_3);return;
+    }
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    unsigned owner=surface_pool_acquire(&s_region_pool,x,y,w,h,x,y,w,h,s_out_scale,0);
+    if(!owner)abort();
+    GlRasterSurface *previous=s_draw_surface;int scale=s_hr_scale;
+    s_draw_surface=s_region_pool.surfaces[owner];s_hr_scale=s_out_scale;
+    present_vram_surface_impl(x,y,w,h,linear,force_4_3);
+    s_draw_surface=previous;s_hr_scale=scale;
+}
+
 
 /* Native-wide fast path: authoritatively copy the canonical 4:3 framebuffer
  * into the wide surface's CENTRE columns [g_wide_off, g_wide_off+native_w) for
@@ -13165,6 +13289,23 @@ static int dyn_apply(int snew) {
     flush_tex_batch();
     flush_cpu_upload();
     hiw_flush_queue();
+    if(s_region_pool.coverage.rects) {
+        if(!surface_pool_rescale(&s_region_pool,snew)){s_dyn_stats.refused++;return 0;}
+        s_primary_surface.allocation_scale=snew;s_hr_scale=s_out_scale=snew;
+        s_shift_hr=s_shift_hi=.5f/(float)snew-1.f/64.f;
+        p_glUseProgram(s_geo_prog);p_glUniform1f(s_geo_uShift,s_shift_hr);
+        p_glUseProgram(s_tex_prog);p_glUniform1f(s_tex_uShift,s_shift_hr);
+        p_glUseProgram(s_blit_prog);
+        p_glUniform1f(p_glGetUniformLocation(s_blit_prog,"u_shift"),s_shift_hr);
+        p_glUseProgram(0);
+        s_pb_valid=0;pass_gens_invalidate();
+        for(int row=0;row<PRES_ROWS;++row)s_present_dirty[row]=~0ull;
+        dyn_stats_lock();s_dyn_stats.steps++;s_dyn_stats.last_from=sold;s_dyn_stats.last_to=snew;
+        s_dyn_stats.last_ms=dyn_ms(t0,SDL_GetPerformanceCounter());
+        s_dyn_stats.last_prep_ms=s_dyn_stats.last_seed_ms=s_dyn_stats.last_rects_ms=s_dyn_stats.last_wide_ms=0;
+        s_dyn_stats.last_rects=(int)s_region_pool.coverage.count;dyn_stats_unlock();
+        return 1;
+    }
     pack_flush();
     const uint64_t t1 = dyn_mark();
     /* 2a. The pack's samples, 1x. */
@@ -17581,6 +17722,14 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
     s_rth_packet_last_sequence=packet->sequence;
 done:
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();hiw_flush_queue();
+    if(s_region_pool.coverage.rects) {
+        unsigned keep[2]={0,0};
+        for(size_t i=1;i<s_region_pool.count;++i)
+            if(s_region_pool.surfaces[i]==s_draw_surface)keep[0]=(unsigned)i;
+        if(s_pb_valid || s_pass_active)for(size_t i=1;i<s_region_pool.count;++i)
+            if(s_region_pool.surfaces[i]==s_pb_surface)keep[1]=(unsigned)i;
+        surface_pool_collect(&s_region_pool,keep,2);
+    }
     packet_timer_end();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
 }
@@ -17722,6 +17871,12 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
         (unsigned long long)atomic_load(&s_pack_native_uploads),
         (unsigned long long)atomic_load(&s_pack_native_bytes));
     uint64_t gpu[5];gl_renderer_packet_gpu_stats(gpu);
+    if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
+        "\"surfaces\":{\"allocations\":%llu,\"pixels\":%llu,\"declared_bytes\":%llu,\"largest_pixels\":%llu},",
+        (unsigned long long)atomic_load(&s_surface_stats[0]),
+        (unsigned long long)atomic_load(&s_surface_stats[1]),
+        (unsigned long long)atomic_load(&s_surface_stats[2]),
+        (unsigned long long)atomic_load(&s_surface_stats[3]));
     if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
         "\"gpu_packet\":{\"samples\":%llu,\"total_ns\":%llu,\"present_ns\":%llu,\"max_ns\":%llu,\"dropped\":%llu,"
         "\"slot_wait_ns\":%llu,\"slot_wait_dropped\":%llu,\"fence_retired\":%llu},",

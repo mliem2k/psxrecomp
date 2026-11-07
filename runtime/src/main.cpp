@@ -4654,6 +4654,9 @@ struct MainCadenceStats {
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
     uint64_t stage_start = 0, stage_ticks[5] = {}, worst_ticks[5] = {};
     uint64_t previous_cpu = 0, worst_cpu = 0, worst_index = 0, over20 = 0;
+    uint64_t previous_cycles=0,total_cycles=0,max_cycles=0,worst_cycles=0;
+    uint64_t previous_passes=0,worst_passes=0;
+    double worst_pass_ms=0;
     unsigned stage = 0; /* guest, frontend, packet publication, epilogue, pacing */
     uint64_t return_previous=0, return_max=0, return_over20=0;
     uint64_t native_submit=0,native_sync=0,worst_submit=0,worst_sync=0;
@@ -4668,6 +4671,13 @@ static uint64_t main_cadence_cpu() {
     if(GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user))
         return ((uint64_t)kernel.dwHighDateTime<<32)+kernel.dwLowDateTime+
                ((uint64_t)user.dwHighDateTime<<32)+user.dwLowDateTime;
+#endif
+    return 0;
+}
+static uint64_t main_cadence_cycles() {
+#ifdef _WIN32
+    ULONG64 cycles=0;
+    if(QueryThreadCycleTime(GetCurrentThread(),&cycles))return cycles;
 #endif
     return 0;
 }
@@ -4695,12 +4705,17 @@ static void main_cadence_frame() {
     main_cadence_stage(1);
     const uint64_t now = s_main_cadence.stage_start;
     const uint64_t cpu = main_cadence_cpu();
+    const uint64_t cycles=main_cadence_cycles();
+    RenderPassStats passes{};render_pass_get_stats(&passes);
     uint64_t submit=0,sync=0;
     native_raster_producer_timing(1,&submit,&sync);
     FramePacketProducerTiming packet_timing;
     frame_packet_producer_timing(1,&packet_timing);
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
+        const uint64_t work=cycles-s_main_cadence.previous_cycles;
+        s_main_cadence.total_cycles+=work;
+        if(work>s_main_cadence.max_cycles)s_main_cadence.max_cycles=work;
         ++s_main_cadence.intervals;
         s_main_cadence.ticks += elapsed;
         if(elapsed > SDL_GetPerformanceFrequency()/50) ++s_main_cadence.over20;
@@ -4708,6 +4723,9 @@ static void main_cadence_frame() {
             s_main_cadence.max_ticks = elapsed;
             memcpy(s_main_cadence.worst_ticks,s_main_cadence.stage_ticks,sizeof s_main_cadence.worst_ticks);
             s_main_cadence.worst_cpu=cpu-s_main_cadence.previous_cpu;
+            s_main_cadence.worst_cycles=work;
+            s_main_cadence.worst_passes=passes.passes-s_main_cadence.previous_passes;
+            s_main_cadence.worst_pass_ms=s_main_cadence.worst_passes?passes.last_pass_ms:0;
             s_main_cadence.worst_index=s_main_cadence.intervals;
             s_main_cadence.worst_end=now;
             s_main_cadence.worst_frame=s_frame_count;
@@ -4722,6 +4740,7 @@ static void main_cadence_frame() {
     }
     s_main_cadence.previous = now;
     s_main_cadence.previous_cpu=cpu;
+    s_main_cadence.previous_cycles=cycles;s_main_cadence.previous_passes=passes.passes;
     s_main_cadence.native_submit=submit;s_main_cadence.native_sync=sync;
     s_main_cadence.packet_timing=packet_timing;
     memset(s_main_cadence.stage_ticks,0,sizeof s_main_cadence.stage_ticks);
@@ -4761,7 +4780,9 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         "\"return_max_ms\":%.3f,\"return_over20\":%llu,"
         "\"worst_native_submit_ms\":%.3f,\"worst_native_sync_ms\":%.3f,\"worst_end_ns\":%llu,"
         "\"worst_alloc_ms\":%.3f,\"worst_cleanup_ms\":%.3f,\"worst_alloc_count\":%llu,\"worst_alloc_bytes\":%llu,\"worst_frame\":%llu,"
-        "\"window_start_ns\":%llu,\"window_end_ns\":%llu",
+        "\"window_start_ns\":%llu,\"window_end_ns\":%llu,"
+        "\"thread_cycles_mean\":%llu,\"thread_cycles_max\":%llu,\"worst_thread_cycles\":%llu,"
+        "\"worst_extra_passes\":%llu,\"worst_extra_pass_ms\":%.3f",
         (unsigned long long)s.over20,(unsigned long long)s.worst_index,s.worst_cpu*.0001,
         s.worst_ticks[0]*ms,s.worst_ticks[1]*ms,s.worst_ticks[2]*ms,
         s.worst_ticks[3]*ms,s.worst_ticks[4]*ms,s.return_max*ms,(unsigned long long)s.return_over20,
@@ -4770,7 +4791,10 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         (unsigned long long)s.worst_packet_timing.growth_count,(unsigned long long)s.worst_packet_timing.growth_bytes,
         (unsigned long long)s.worst_frame,
         (unsigned long long)((s.previous-s.ticks)*(1e9/freq)),
-        (unsigned long long)(s.previous*(1e9/freq)));
+        (unsigned long long)(s.previous*(1e9/freq)),
+        (unsigned long long)(s.intervals?s.total_cycles/s.intervals:0),
+        (unsigned long long)s.max_cycles,(unsigned long long)s.worst_cycles,
+        (unsigned long long)s.worst_passes,s.worst_pass_ms);
 }
 
 static bool runtime_perf_parse_window(const char *text, uint64_t *start,

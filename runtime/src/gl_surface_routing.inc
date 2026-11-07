@@ -7,9 +7,14 @@ static void surface_wide_select(void) {
     int y=s_area_y1<0?0:s_area_y1;
     int end=s_area_y2+1>VRAM_H?VRAM_H:s_area_y2+1;
     int origin=g_wide_cur_base-g_wide_off-view_shift;
+    int valid_x=g_wide_cur_base>origin?g_wide_cur_base:origin;
+    int valid_end=g_wide_cur_base+g_wide_w-2*g_wide_off;
+    if(valid_end>origin+g_wide_w)valid_end=origin+g_wide_w;
+    if(valid_x<0)valid_x=0;if(valid_end>VRAM_W)valid_end=VRAM_W;
     GlRasterSurface *current=surface_pool_find(&s_region_pool,g_wide_cur);
     if(current && current->x==origin && current->y==y && current->h==end-y &&
-        current->w==g_wide_w && current->allocation_scale==s_out_scale) {
+        current->w==g_wide_w && current->allocation_scale==s_out_scale &&
+        surface_pool_owns(&s_region_pool,current,valid_x,y,valid_end-valid_x,end-y)) {
         s_draw_surface=current;s_hr_scale=s_out_scale;return;
     }
     flush_flat_batch();flush_tex_batch();

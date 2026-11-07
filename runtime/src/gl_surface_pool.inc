@@ -1,12 +1,24 @@
 /* Render-owner allocations. Canonical coverage never includes wide reveal
  * margins; colour/depth transfers preserve enhanced pixels when ownership
  * changes between a display allocation and offscreen tiles. */
+static void surface_pool_publish(const GlSurfacePool *pool) {
+    if(pool!=&s_region_pool)return;
+    uint64_t count=0,pixels=0,largest=0;
+    for(size_t i=1;i<pool->count;++i) {
+        const GlRasterSurface *s=pool->surfaces[i];if(!s)continue;
+        uint64_t area=(uint64_t)s->w*s->h*s->allocation_scale*s->allocation_scale;
+        ++count;pixels+=area;if(area>largest)largest=area;
+    }
+    atomic_store(&s_surface_stats[0],count);atomic_store(&s_surface_stats[1],pixels);
+    atomic_store(&s_surface_stats[2],pixels*8);atomic_store(&s_surface_stats[3],largest);
+}
 static int surface_pool_init(GlSurfacePool *pool) {
     memset(pool,0,sizeof *pool);
     if(!gl_coverage_init(&pool->coverage,VRAM_W,VRAM_H))return 0;
     pool->surfaces=(GlRasterSurface **)calloc(8,sizeof *pool->surfaces);
     if(!pool->surfaces){gl_coverage_destroy(&pool->coverage);return 0;}
     pool->capacity=8;pool->count=1;
+    surface_pool_publish(pool);
     return 1;
 }
 static void surface_pool_destroy(GlSurfacePool *pool) {
@@ -20,6 +32,7 @@ static void surface_pool_destroy(GlSurfacePool *pool) {
     }
     free(pool->surfaces);gl_coverage_destroy(&pool->coverage);
     memset(pool,0,sizeof *pool);
+    surface_pool_publish(pool);
 }
 /* Call after flushing batches. Retain any front/back target handles still
  * used by the caller; otherwise allocations without canonical owners can
@@ -35,11 +48,21 @@ static void surface_pool_collect(GlSurfacePool *pool,const unsigned *keep,size_t
         p_glDeleteFramebuffers(1,&s->fbo);p_glDeleteRenderbuffers(1,&s->rb);glDeleteTextures(1,&s->tex);
         free(s);pool->surfaces[i]=NULL;
     }
+    surface_pool_publish(pool);
 }
 static GlRasterSurface *surface_pool_find(GlSurfacePool *pool,GLuint fbo) {
     for(size_t i=1;i<pool->count;++i)
         if(pool->surfaces[i] && pool->surfaces[i]->fbo==fbo)return pool->surfaces[i];
     return NULL;
+}
+static int surface_pool_owns(const GlSurfacePool *pool,const GlRasterSurface *surface,
+                            int x,int y,int w,int h) {
+    for(size_t i=0;i<pool->coverage.count;++i) {
+        const GlCoverageRect *r=pool->coverage.rects+i;
+        if(r->x>=x+w || r->y>=y+h || r->x+r->w<=x || r->y+r->h<=y)continue;
+        if(!r->owner || pool->surfaces[r->owner]!=surface)return 0;
+    }
+    return 1;
 }
 /* R16UI has already received these exact native upload rectangles. Apply
  * them only to owned canonical pieces, never to another target's reveal. */
@@ -147,6 +170,7 @@ static unsigned surface_pool_acquire(GlSurfacePool *pool,
     int assigned=tile?gl_coverage_claim_native(&pool->coverage,valid_x,valid_y,valid_w,valid_h,owner):
         gl_coverage_replace(&pool->coverage,valid_x,valid_y,valid_w,valid_h,owner);
     if(!assigned)return 0;
+    surface_pool_publish(pool);
     return owner;
 }
 /* Display bands have independent allocations even when vertical buffering
@@ -161,5 +185,49 @@ static GlRasterSurface *surface_pool_display(GlSurfacePool *pool,
     if(valid_x<0)valid_x=0;if(valid_end>VRAM_W)valid_end=VRAM_W;
     unsigned owner=surface_pool_acquire(pool,origin,y,output_w,h,
         valid_x,y,valid_end-valid_x,h,scale,0);
+    if(owner){pool->surfaces[owner]->display=1;pool->surfaces[owner]->display_base=base_x;}
     return owner?pool->surfaces[owner]:NULL;
+}
+static GlRasterSurface *surface_pool_display_find(GlSurfacePool *pool,int base_x,int y,int h) {
+    GlRasterSurface *found=NULL;
+    for(size_t i=1;i<pool->count;++i) {
+        GlRasterSurface *s=pool->surfaces[i];
+        if(!s || !s->display || s->display_base!=base_x || s->y>y || s->y+s->h<y+h)continue;
+        int owned=0;
+        for(size_t j=0;j<pool->coverage.count && !owned;++j)
+            owned=pool->coverage.rects[j].owner==i;
+        if(owned && (!found || s->h<found->h))found=s;
+    }
+    return found;
+}
+static int surface_pool_rescale(GlSurfacePool *pool,int scale) {
+    GlRasterSurface *next=calloc(pool->count,sizeof *next);
+    if(!next)return 0;
+    int ok=1;
+    for(size_t i=1;i<pool->count;++i) {
+        const GlRasterSurface *old=pool->surfaces[i];if(!old)continue;
+        next[i]=*old;next[i].tex=next[i].fbo=next[i].rb=0;
+        next[i].allocation_scale=scale;
+        if(!raster_surface_alloc(old->w,old->h,scale,&next[i].tex,&next[i].rb,&next[i].fbo)){ok=0;break;}
+    }
+    if(ok)for(size_t i=1;i<pool->count;++i) {
+        GlRasterSurface *old=pool->surfaces[i];if(!old)continue;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,old->fbo);
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,next[i].fbo);glDisable(GL_SCISSOR_TEST);
+        p_glBlitFramebuffer(0,0,old->w*old->allocation_scale,old->h*old->allocation_scale,
+            0,0,old->w*scale,old->h*scale,GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT,GL_NEAREST);
+    }
+    for(size_t i=1;i<pool->count;++i) {
+        GlRasterSurface *old=pool->surfaces[i];
+        if(ok && old) {
+            if(g_wide_cur==old->fbo)g_wide_cur=next[i].fbo;
+            GlRasterSurface retired=*old;*old=next[i];next[i]=retired;
+        }
+        if(next[i].fbo)p_glDeleteFramebuffers(1,&next[i].fbo);
+        if(next[i].rb)p_glDeleteRenderbuffers(1,&next[i].rb);
+        if(next[i].tex)glDeleteTextures(1,&next[i].tex);
+    }
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);free(next);
+    surface_pool_publish(pool);
+    return ok;
 }
