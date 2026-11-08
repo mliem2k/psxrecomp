@@ -5990,13 +5990,49 @@ static bool current_right_stick(int s, int* rx, int* ry) {
     return have;
 }
 
+/* Shared right-stick-to-buttons reel configuration. Defaults match the
+ * Fisherman's Bait titles; other ports override with these env vars so the
+ * gesture lives in the framework instead of a per-title patch. */
+struct ButtonReelConfig {
+    bool enabled = true;
+    uint64_t hold_ms = 300;
+    uint64_t pulse_ms = 50;
+    uint16_t button_a = 0xBFFFu;
+    uint16_t button_b = 0xDFFFu;
+};
+
+static ButtonReelConfig load_button_reel_config(void) {
+    ButtonReelConfig cfg;
+    if (const char* value = std::getenv("PSX_RECOMP_REEL"))
+        cfg.enabled = !(value[0] == '\0' || value[0] == '0');
+    if (const char* value = std::getenv("PSX_RECOMP_REEL_HOLD_MS")) {
+        const unsigned long long parsed = std::strtoull(value, nullptr, 0);
+        if (parsed != 0u) cfg.hold_ms = parsed;
+    }
+    if (const char* value = std::getenv("PSX_RECOMP_REEL_PULSE_MS")) {
+        const unsigned long long parsed = std::strtoull(value, nullptr, 0);
+        if (parsed != 0u) cfg.pulse_ms = parsed;
+    }
+    if (const char* value = std::getenv("PSX_RECOMP_REEL_BUTTON_A"))
+        cfg.button_a = static_cast<uint16_t>(std::strtoul(value, nullptr, 0));
+    if (const char* value = std::getenv("PSX_RECOMP_REEL_BUTTON_B"))
+        cfg.button_b = static_cast<uint16_t>(std::strtoul(value, nullptr, 0));
+    return cfg;
+}
+
+static const ButtonReelConfig& button_reel_config(void) {
+    static const ButtonReelConfig cfg = load_button_reel_config();
+    return cfg;
+}
+
 /* Refresh the synthetic A/B word for one frame. Slot 0 only: P1 owns the
  * title's pad gate and the host layer. */
 static void update_button_reel(int s) {
     if (s != 0 || s >= PSX_MAX_PLAYERS) return;
+    const ButtonReelConfig& cfg = button_reel_config();
     PlayerInput& p = g_players[s];
     p.button_reel_word = 0xFFFFu;
-    if (psx_netplay_active() ||
+    if (!cfg.enabled || psx_netplay_active() ||
         p.mode != PSXRecompV4::PAD_MODE_DIGITAL || !g_allow_pad_config) {
         p.reel_active_since = 0;
         p.button_reel_started = 0;
@@ -6021,20 +6057,22 @@ static void update_button_reel(int s) {
         p.reel_active_since = now;
         return;
     }
-    if (now - p.reel_active_since < 300) return;
+    if (now - p.reel_active_since < cfg.hold_ms) return;
 
     if (p.button_reel_started == 0) {
         p.button_reel_started = now;
         std::fprintf(stdout,
-                     "psxrecomp runtime: right-stick reel -> buttons (A/B) "
-                     "for slot %d\n", s + 1);
+                     "psxrecomp runtime: right-stick reel -> buttons for slot "
+                     "%d (hold=%llu ms pulse=%llu ms)\n", s + 1,
+                     (unsigned long long)cfg.hold_ms,
+                     (unsigned long long)cfg.pulse_ms);
         std::fflush(stdout);
     }
-    /* 50 ms halves: even = press, odd = release; each press pair alternates
-     * Cross then Circle, so a 200 ms cycle produces one press of each. */
-    const uint64_t step = (now - p.button_reel_started) / 50u;
+    /* Even pulse = press, odd = release; each press pair alternates the two
+     * configured buttons, so one full cycle produces one press of each. */
+    const uint64_t step = (now - p.button_reel_started) / cfg.pulse_ms;
     if ((step & 1u) == 0u)
-        p.button_reel_word = ((step >> 1) & 1u) ? 0xDFFFu : 0xBFFFu;
+        p.button_reel_word = ((step >> 1) & 1u) ? cfg.button_b : cfg.button_a;
 }
 
 /* The synthetic bits to merge into the active-low pad word, or 0xFFFF when
@@ -6043,7 +6081,8 @@ static void update_button_reel(int s) {
 static uint16_t button_reel_word(int s) {
     if (s != 0 || s >= PSX_MAX_PLAYERS || psx_netplay_active()) return 0xFFFFu;
     const PlayerInput& p = g_players[s];
-    if (p.mode != PSXRecompV4::PAD_MODE_DIGITAL || !g_allow_pad_config)
+    if (!button_reel_config().enabled ||
+        p.mode != PSXRecompV4::PAD_MODE_DIGITAL || !g_allow_pad_config)
         return 0xFFFFu;
     return p.button_reel_word;
 }
