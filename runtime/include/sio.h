@@ -174,6 +174,10 @@ void sio_set_pad_negcon(int slot, uint8_t i, uint8_t ii, uint8_t l);
 void sio_get_pad_negcon(int slot, uint8_t out[3]);
 /* 1 while the game has locked the pad's analog mode (0x44 lock byte 0x03). */
 int sio_get_pad_mode_locked(int slot);
+/* Monotonic count of game-issued 0x44 set-mode commands for this slot. Hosts
+ * that mirror the game's choice compare this instead of polling the live type
+ * (which can still hold a pending host F7 request for a frame). */
+uint32_t sio_get_pad_modeselect_seq(int slot);
 
 /* Connect / disconnect a logical pad (0 .. PSX_MAX_PLAYERS-1). By default no
  * pads are connected during initial BIOS boot. */

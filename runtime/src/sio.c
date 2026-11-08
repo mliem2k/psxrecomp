@@ -54,6 +54,10 @@ static PSXResolvedDigitalPad pad_input_history[PSX_MAX_PLAYERS];
  * 0..255, 0x80 centred. JogCon uses left-X as a signed wheel position; NeGcon
  * uses it as the 0..255 twist axis (0x80 centred). */
 static PSX_BSS uint8_t pad_analog[PSX_MAX_PLAYERS];
+/* Monotonic count of game-issued 0x44 set-mode commands per slot. The host
+ * follows the game's own analog/digital choice only when this changes, so a
+ * host F7 toggle cannot be immediately undone by the stale type getter. */
+static PSX_BSS uint32_t pad_modeselect_seq[PSX_MAX_PLAYERS];
 static uint8_t pad_stick[PSX_MAX_PLAYERS][4] = {
     PSX_PAD_INIT({ 0x80, 0x80, 0x80, 0x80 })
 }; /* lx,ly,rx,ry */
@@ -1248,6 +1252,10 @@ int sio_get_pad_analog(int slot) {
     return (slot >= 0 && slot < PSX_MAX_PLAYERS) ? pad_analog[slot] : 0;
 }
 
+uint32_t sio_get_pad_modeselect_seq(int slot) {
+    return (slot >= 0 && slot < PSX_MAX_PLAYERS) ? pad_modeselect_seq[slot] : 0;
+}
+
 void sio_get_pad_sticks(int slot, uint8_t out[4]) {
     if (!out) return;
     if (slot < 0 || slot >= PSX_MAX_PLAYERS) {
@@ -1693,6 +1701,7 @@ static void pad_process_byte(uint8_t tx_byte) {
                 (tx_byte == 0x01) ? pad_analog_device[pad_active_logical]
                                   : (uint8_t)SIO_PAD_DIGITAL;
             pad_type_req[pad_active_logical] = -1;
+            pad_modeselect_seq[pad_active_logical]++;
         }
         /* 0x44 lock byte (data position 4, the byte after the mode byte): 0x03 =>
          * lock analog mode, 0x02 => unlock (dualshock.cpp:714-725). A locked slot
