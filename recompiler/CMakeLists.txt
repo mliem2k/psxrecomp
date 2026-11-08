@@ -840,6 +840,22 @@ if(BUILD_TESTING)
     add_test(NAME video_enhancement_settings_test
              COMMAND video_enhancement_settings_test)
 
+    # [controller] reel and [widescreen] adaptive_view opt-in plumbing.
+    add_executable(fishing_reel_config_test
+        tests/fishing_reel_config_test.cpp
+        src/config_loader.cpp
+        src/ps1_exe_parser.cpp
+    )
+    target_include_directories(fishing_reel_config_test PRIVATE
+        include
+        src
+        lib/fmt/include
+        lib/toml11
+    )
+    target_link_libraries(fishing_reel_config_test PRIVATE fmt)
+    add_test(NAME fishing_reel_config_test
+             COMMAND fishing_reel_config_test)
+
     # [video] rewind opt-in plumbing (default off + settings round trip).
     add_executable(rewind_settings_test
         tests/rewind_settings_test.cpp
