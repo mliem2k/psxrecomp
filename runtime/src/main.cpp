@@ -1747,6 +1747,13 @@ static double        g_fov_scale = 1.0;
  * initial window; after the game window exists these values follow its live
  * aspect, clamped to 4:3..the widest mode offered by the title. */
 static bool          g_ws_adaptive_view = false;
+/* [widescreen] adaptive_view from game.toml: the title opts into the live,
+ * resize-driven aspect. The user's settings.toml choice can turn it off. */
+static bool          g_ws_adaptive_supported = false;
+static bool          g_ws_adaptive_title_default = false;
+static int           g_ws_adaptive_user_choice = -1; /* -1 title, 0 off, 1 on */
+static int           g_ws_adaptive_title_max_num = 16;
+static int           g_ws_adaptive_title_max_den = 9;
 static int           g_ws_adaptive_max_num = 16;
 static int           g_ws_adaptive_max_den = 9;
 static bool ensure_sdl_pixel_buf_capacity(size_t pixels) {
@@ -1937,9 +1944,11 @@ static void reset_mod_owned_presentation(void) {
     }
     /* Fit / capped resize-driven aspect. The fixed aspect is the launcher's
      * (and netplay's) to set, so it is left alone here. */
-    g_ws_adaptive_view = false;
-    g_ws_adaptive_max_num = 16;
-    g_ws_adaptive_max_den = 9;
+    g_ws_adaptive_view =
+        g_ws_adaptive_user_choice >= 0 ? (g_ws_adaptive_user_choice != 0)
+                                       : g_ws_adaptive_title_default;
+    g_ws_adaptive_max_num = g_ws_adaptive_title_max_num;
+    g_ws_adaptive_max_den = g_ws_adaptive_title_max_den;
     gpu_ws_set_auto_ui_proportional(g_ws_auto_ui_proportional_cfg ? 1 : 0);
     psx_mod_set_world_scene_predicate(nullptr);
     gpu_ws_set_native_scene_predicate(nullptr);
@@ -2347,6 +2356,9 @@ static void refresh_widescreen_projection() {
  * sidecar width from it, just as the fixed 16:9/21:9 modes do. */
 static void update_adaptive_widescreen() {
     if (!g_ws_adaptive_view || !sdl_window) return;
+    /* Netplay keeps its synchronized presentation: the host window must not
+     * change the guest-visible projection mid-match. */
+    if (psx_netplay_active()) return;
 
     int width = 0, height = 0;
     SDL_GetWindowSize(sdl_window, &width, &height);
@@ -5991,18 +6003,22 @@ static bool current_right_stick(int s, int* rx, int* ry) {
 }
 
 /* Shared right-stick-to-buttons reel configuration. Defaults match the
- * Fisherman's Bait titles; other ports override with these env vars so the
- * gesture lives in the framework instead of a per-title patch. */
+ * Fisherman's Bait titles; a port selects its own gesture with
+ * [controller] reel = "ab" | "cross" | "circle" | "off" and the timings with
+ * reel_hold_ms / reel_pulse_ms. The env vars stay as per-run overrides. */
 struct ButtonReelConfig {
     bool enabled = true;
+    bool hold = false;              /* hold one button instead of pulsing */
     uint64_t hold_ms = 300;
     uint64_t pulse_ms = 50;
     uint16_t button_a = 0xBFFFu;
     uint16_t button_b = 0xDFFFu;
 };
 
-static ButtonReelConfig load_button_reel_config(void) {
-    ButtonReelConfig cfg;
+static ButtonReelConfig g_button_reel_cfg;
+static bool g_button_reel_cfg_ready = false;
+
+static void button_reel_env_overrides(ButtonReelConfig& cfg) {
     if (const char* value = std::getenv("PSX_RECOMP_REEL"))
         cfg.enabled = !(value[0] == '\0' || value[0] == '0');
     if (const char* value = std::getenv("PSX_RECOMP_REEL_HOLD_MS")) {
@@ -6017,12 +6033,46 @@ static ButtonReelConfig load_button_reel_config(void) {
         cfg.button_a = static_cast<uint16_t>(std::strtoul(value, nullptr, 0));
     if (const char* value = std::getenv("PSX_RECOMP_REEL_BUTTON_B"))
         cfg.button_b = static_cast<uint16_t>(std::strtoul(value, nullptr, 0));
-    return cfg;
 }
 
 static const ButtonReelConfig& button_reel_config(void) {
-    static const ButtonReelConfig cfg = load_button_reel_config();
-    return cfg;
+    if (!g_button_reel_cfg_ready) {
+        g_button_reel_cfg = ButtonReelConfig{};
+        button_reel_env_overrides(g_button_reel_cfg);
+        g_button_reel_cfg_ready = true;
+    }
+    return g_button_reel_cfg;
+}
+
+/* Apply the title's [controller] reel selection before the first frame.
+ * A title that omits the keys keeps the historical A/B gesture. */
+static void apply_button_reel_config(const PSXRecompV4::RuntimeConfig& rc) {
+    ButtonReelConfig cfg;
+    if (rc.has_reel) {
+        if (rc.reel == "off") {
+            cfg.enabled = false;
+        } else if (rc.reel == "cross") {
+            cfg.hold = true;
+            cfg.button_a = 0xBFFFu;
+        } else if (rc.reel == "circle") {
+            cfg.hold = true;
+            cfg.button_a = 0xDFFFu;
+        }
+    }
+    if (rc.has_reel_hold_ms) cfg.hold_ms = static_cast<uint64_t>(rc.reel_hold_ms);
+    if (rc.has_reel_pulse_ms) cfg.pulse_ms = static_cast<uint64_t>(rc.reel_pulse_ms);
+    button_reel_env_overrides(cfg);
+    g_button_reel_cfg = cfg;
+    g_button_reel_cfg_ready = true;
+    if (cfg.enabled) {
+        std::fprintf(stdout,
+                     "psxrecomp runtime: right-stick reel %s (hold=%llu ms "
+                     "pulse=%llu ms)\n",
+                     cfg.hold ? "holds one button" : "pulses A/B",
+                     (unsigned long long)cfg.hold_ms,
+                     (unsigned long long)cfg.pulse_ms);
+        std::fflush(stdout);
+    }
 }
 
 /* Refresh the synthetic A/B word for one frame. Slot 0 only: P1 owns the
@@ -6063,10 +6113,15 @@ static void update_button_reel(int s) {
         p.button_reel_started = now;
         std::fprintf(stdout,
                      "psxrecomp runtime: right-stick reel -> buttons for slot "
-                     "%d (hold=%llu ms pulse=%llu ms)\n", s + 1,
+                     "%d (%s, hold=%llu ms pulse=%llu ms)\n", s + 1,
+                     cfg.hold ? "hold" : "pulse",
                      (unsigned long long)cfg.hold_ms,
                      (unsigned long long)cfg.pulse_ms);
         std::fflush(stdout);
+    }
+    if (cfg.hold) {
+        p.button_reel_word = cfg.button_a;
+        return;
     }
     /* Even pulse = press, odd = release; each press pair alternates the two
      * configured buttons, so one full cycle produces one press of each. */
@@ -18586,6 +18641,16 @@ int main(int argc, char** argv) {
             g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
             g_fmv_skip_no_xa_hold  = gc.runtime.video_fmv_skip_no_xa_hold;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
+            /* [widescreen] adaptive_view: the title opts into a live,
+             * resize-driven aspect. Its [video] aspect_ratio shapes the first
+             * window; offer_ultrawide raises the live cap from 16:9 to 21:9. */
+            g_ws_adaptive_supported = gc.ws_adaptive_view;
+            g_ws_adaptive_title_default = gc.ws_adaptive_view;
+            g_ws_adaptive_view = gc.ws_adaptive_view;
+            g_ws_adaptive_title_max_num = gc.ws_ultrawide_offered ? 21 : 16;
+            g_ws_adaptive_title_max_den = 9;
+            g_ws_adaptive_max_num = g_ws_adaptive_title_max_num;
+            g_ws_adaptive_max_den = g_ws_adaptive_title_max_den;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             gpu_ws_set_auto_ui_squash(gc.ws_auto_ui_squash ? 1 : 0);
             gpu_ws_set_auto_ui_in_place(gc.ws_auto_ui_in_place ? 1 : 0);
@@ -18887,6 +18952,7 @@ int main(int argc, char** argv) {
                     if (i >= 2) player_mode[i] = gc.runtime.default_p1_mode;
                 }
             }
+            apply_button_reel_config(gc.runtime);
             if (gc.runtime.has_default_p1_device)
                 player_device[0] = gc.runtime.default_p1_device;
             if (PSX_MAX_PLAYERS >= 2 && gc.runtime.has_default_p2_device)
@@ -19122,6 +19188,10 @@ int main(int argc, char** argv) {
             g_video_aspect_num = us.aspect_num;
             g_video_aspect_den = us.aspect_den;
         }
+        if (us.has_adaptive_view && g_ws_adaptive_supported) {
+            g_ws_adaptive_user_choice = us.adaptive_view ? 1 : 0;
+            g_ws_adaptive_view = us.adaptive_view;
+        }
         if (us.has_hotkey_pad_rewind)
             g_hotkey_pad_rewind = normalize_hotkey_pad_binding(
                 us.hotkey_pad_rewind,
@@ -19283,15 +19353,19 @@ int main(int argc, char** argv) {
 
     /* Widescreen/View mode is mod-owned on PSX. Clamp the generic display
      * aspect to native 4:3 so neither a legacy game.toml offer/default nor a
-     * stale settings.toml value can engage it before trusted mod activation. */
-    if (!ws_offered && (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
+     * stale settings.toml value can engage it before trusted mod activation.
+     * A title that opts into [widescreen] adaptive_view owns its default
+     * aspect, so its [video] aspect_ratio is the initial window shape. */
+    if (!ws_offered && !g_ws_adaptive_view &&
+        (g_video_aspect_num != 4 || g_video_aspect_den != 3)) {
         std::fprintf(stdout, "psxrecomp: widescreen is mod-owned on PSX; "
                      "clamping display aspect %d:%d -> 4:3\n",
                      g_video_aspect_num, g_video_aspect_den);
         g_video_aspect_num = 4;
         g_video_aspect_den = 3;
     }
-    if (!ws_ultrawide_offered && g_video_aspect_num * 9 == g_video_aspect_den * 21) {
+    if (!ws_ultrawide_offered && !g_ws_adaptive_view &&
+        g_video_aspect_num * 9 == g_video_aspect_den * 21) {
         std::fprintf(stdout, "psxrecomp: 21:9 is not offered for this title; clamping to %s\n",
                      ws_offered ? "16:9" : "4:3");
         g_video_aspect_num = ws_offered ? 16 : 4;
