@@ -21658,6 +21658,13 @@ session_reboot:
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
     }
+    {
+        const Uint32 flags = SDL_GetWindowFlags(sdl_window);
+        std::fprintf(stdout, "psxrecomp: game window %dx%d resizable=%d\n",
+                     game_w, game_h,
+                     (flags & SDL_WINDOW_RESIZABLE) ? 1 : 0);
+        std::fflush(stdout);
+    }
     psx_apply_window_icon(sdl_window, argv[0]);
     s_window_fullscreen = {};
     if (psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, g_fullscreen) != 0)
